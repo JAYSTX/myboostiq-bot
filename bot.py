@@ -1,557 +1,401 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-myBoostiq Telegram Bot
-Monitorea boosts y envía alertas VIP y públicas
-"""
+import os, json, time, asyncio, logging, re
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
 
-import os
-import re
-import time
-import logging
-import threading
 import requests
-from datetime import datetime
-from typing import Optional, Dict, List
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
+)
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+    ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
 
-# Cargar variables de entorno
-load_dotenv()
+import config
 
-# Configuración de logging
+# ----------------- LOGS -----------------
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# Variables de entorno
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-VIP_CHAT_ID = os.getenv('VIP_CHAT_ID')
-PUBLIC_CHAT_ID = os.getenv('PUBLIC_CHAT_ID')
-API_BASE_URL = os.getenv('API_BASE_URL', 'https://myboostiq-api-6do.pages.dev')
-ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'MyBoost_IQ_1009')
+# ----------------- ENV -----------------
+load_dotenv()
+if not config.BOT_TOKEN or not config.BSC_API_KEY:
+    log.error("Faltan variables: TELEGRAM_BOT_TOKEN o BSC_API_KEY")
+    raise SystemExit(1)
 
-# Estado global del bot
-class BotState:
-    def __init__(self):
-        self.last_boost_id: Optional[int] = None
-        self.vip_alert_sent: bool = False
-        self.public_alert_sent: bool = False
-        self.application: Optional[Application] = None
-        self.user_wallets: Dict[int, str] = {}  # user_id -> wallet
-        
-bot_state = BotState()
-
-
-# ============================================
-# UTILIDADES DE API
-# ============================================
-
-def validate_wallet(wallet: str) -> bool:
-    """Valida formato de wallet (0x + 40 caracteres hexadecimales)"""
-    pattern = r'^0x[a-fA-F0-9]{40}$'
-    return bool(re.match(pattern, wallet))
-
-
-def get_api_status() -> Optional[Dict]:
-    """Obtiene el estado actual del boost desde la API"""
+# ----------------- PERSISTENCIA SIMPLE -----------------
+SUBS_FILE = "subs.json"   # { user_id: { "until": ISO, "tx": "..."} }
+def load_subs() -> Dict[str, Any]:
+    if not os.path.exists(SUBS_FILE): return {}
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/api/status",
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error getting API status: {e}")
-        return None
+        return json.load(open(SUBS_FILE, "r", encoding="utf-8"))
+    except Exception:
+        return {}
 
+def save_subs(data: Dict[str, Any]):
+    json.dump(data, open(SUBS_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-def get_whitelist() -> List[str]:
-    """Obtiene la lista de wallets VIP"""
+subs = load_subs()
+
+# ----------------- L10N -----------------
+def t(lang: str, es: str, en: str) -> str:
+    lang = (lang or "").lower()
+    if lang.startswith("es"): return es
+    if lang.startswith("en"): return en
+    return f"{es}\n\n{en}"
+
+def menu_keyboard(lang: str) -> InlineKeyboardMarkup:
+    es = [
+        [InlineKeyboardButton("📢 Canal Público", url=f"https://t.me/{str(config.CHANNEL_ID).replace('-100','')}")],
+        [InlineKeyboardButton("💬 Grupo de Alertas", url=f"https://t.me/{config.ALERTS_GROUP_USER.lstrip('@')}")],
+        [InlineKeyboardButton("💎 Grupo VIP", url=f"https://t.me/{config.VIP_GROUP_USER.lstrip('@')}")],
+        [InlineKeyboardButton("🌐 Web Oficial", url=config.OFFICIAL_WEB)],
+    ]
+    en = [
+        [InlineKeyboardButton("📢 Public Channel", url=f"https://t.me/{str(config.CHANNEL_ID).replace('-100','')}")],
+        [InlineKeyboardButton("💬 Alerts Group", url=f"https://t.me/{config.ALERTS_GROUP_USER.lstrip('@')}")],
+        [InlineKeyboardButton("💎 VIP Group", url=f"https://t.me/{config.VIP_GROUP_USER.lstrip('@')}")],
+        [InlineKeyboardButton("🌐 Official Website", url=config.OFFICIAL_WEB)],
+    ]
+    if (lang or "").lower().startswith("es"): return InlineKeyboardMarkup(es)
+    if (lang or "").lower().startswith("en"): return InlineKeyboardMarkup(en)
+    # mixto
+    mixed = [
+        [InlineKeyboardButton("📢 Canal / Channel", url=f"https://t.me/{str(config.CHANNEL_ID).replace('-100','')}")],
+        [InlineKeyboardButton("💬 Alertas / Alerts", url=f"https://t.me/{config.ALERTS_GROUP_USER.lstrip('@')}")],
+        [InlineKeyboardButton("💎 VIP", url=f"https://t.me/{config.VIP_GROUP_USER.lstrip('@')}")],
+        [InlineKeyboardButton("🌐 Web / Website", url=config.OFFICIAL_WEB)],
+    ]
+    return InlineKeyboardMarkup(mixed)
+
+# ----------------- HELPERS -----------------
+def is_owner(user_id: int) -> bool:
+    return int(user_id) == int(config.OWNER_ID)
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def until_from_now(days: int) -> datetime:
+    return now_utc() + timedelta(days=days)
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# BscScan verificación de USDT (BEP20) -> destinatario SUB_WALLET y cantidad >= PRICE_USDT
+def verify_usdt_payment(tx: str) -> tuple[bool, str]:
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/api/whitelist",
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get('whitelist', [])
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error getting whitelist: {e}")
-        return []
+        # 1) detalle de token transfers para TX usando 'tokentx' + filtrar por nuestro contrato USDT
+        r = requests.get("https://api.bscscan.com/api", params={
+            "module": "account",
+            "action": "tokentx",
+            "contractaddress": config.USDT_CONTRACT,
+            "txhash": tx,
+            "apikey": config.BSC_API_KEY
+        }, timeout=15)
+        data = r.json()
 
+        if data.get("status") != "1" or not data.get("result"):
+            return False, "No hay transferencias USDT en esa TX."
 
-def add_to_whitelist(wallet: str) -> bool:
-    """Agrega una wallet a la whitelist"""
-    try:
-        headers = {
-            'Authorization': f'Bearer {ADMIN_TOKEN}',
-            'Content-Type': 'application/json'
-        }
-        data = {
-            'action': 'add_whitelist',
-            'wallet_address': wallet
-        }
-        response = requests.post(
-            f"{API_BASE_URL}/api/admin",
-            json=data,
-            headers=headers,
-            timeout=10
-        )
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error adding to whitelist: {e}")
-        return False
+        rec = data["result"][0]  # debería ser único para esa tx y contrato
+        to_addr = rec.get("to", "").lower()
+        if to_addr != config.SUB_WALLET.lower():
+            return False, "El destino no coincide con la wallet de suscripción."
 
+        # cantidad
+        decimals = int(rec.get("tokenDecimal", "18"))
+        value = int(rec.get("value", "0")) / (10 ** decimals)
+        if value + 1e-12 < config.PRICE_USDT:
+            return False, f"Monto insuficiente: {value} USDT < {config.PRICE_USDT} USDT."
 
-def remove_from_whitelist(wallet: str) -> bool:
-    """Elimina una wallet de la whitelist"""
-    try:
-        headers = {
-            'Authorization': f'Bearer {ADMIN_TOKEN}',
-            'Content-Type': 'application/json'
-        }
-        data = {
-            'action': 'remove_whitelist',
-            'wallet_address': wallet
-        }
-        response = requests.post(
-            f"{API_BASE_URL}/api/admin",
-            json=data,
-            headers=headers,
-            timeout=10
-        )
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error removing from whitelist: {e}")
-        return False
+        # 2) estado de recibo
+        r2 = requests.get("https://api.bscscan.com/api", params={
+            "module": "transaction",
+            "action": "gettxreceiptstatus",
+            "txhash": tx,
+            "apikey": config.BSC_API_KEY
+        }, timeout=15)
+        j2 = r2.json()
+        if j2.get("status") != "1" or j2.get("result", {}).get("status") != "1":
+            return False, "La transacción no está confirmada (receipt)."
 
-
-# ============================================
-# COMANDOS DEL BOT
-# ============================================
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start - Mensaje de bienvenida"""
-    welcome_message = (
-        "🚀 *Welcome to myBoostiq VIP Bot!*\n\n"
-        "Get early access to boost alerts and maximize your profits!\n\n"
-        "💎 *VIP BENEFITS:*\n"
-        "• 2 Pumps per week\n"
-        "• Alerts 5 minutes BEFORE boost starts\n"
-        "• Buy signal 5 min early\n"
-        "• Sell signal 5 min early\n"
-        "• Exclusive VIP channel access\n\n"
-        "💰 *SUBSCRIPTION:*\n"
-        "• 50 USDT per week (Monday-Sunday)\n"
-        "• Payment: BEP-20 (BSC Network)\n\n"
-        "*To subscribe:*\n"
-        "1️⃣ Use `/subscribe` to see payment instructions\n"
-        "2️⃣ Send 50 USDT to our wallet\n"
-        "3️⃣ Register with `/register 0xYOUR_WALLET`\n\n"
-        "*Commands:*\n"
-        "• `/subscribe` - Payment instructions\n"
-        "• `/register` - Register as VIP\n"
-        "• `/check` - Verify VIP status\n"
-        "• `/help` - Show all commands\n\n"
-        "🌐 Visit: https://myboostiq.app"
-    )
-    await update.message.reply_text(
-        welcome_message,
-        parse_mode='Markdown'
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /help - Muestra ayuda"""
-    help_message = (
-        "📚 *myBoostiq Bot Commands*\n\n"
-        "*Subscription:*\n"
-        "• `/subscribe` - View payment instructions\n"
-        "• `/register 0xWALLET` - Register as VIP after payment\n"
-        "• `/unregister` - Cancel VIP subscription\n\n"
-        "*Status:*\n"
-        "• `/check` - Check if you're VIP\n\n"
-        "*Information:*\n"
-        "• `/start` - Show welcome message\n"
-        "• `/help` - Show this help\n\n"
-        "💎 *VIP BENEFITS:*\n"
-        "✅ 2 Pumps per week guaranteed\n"
-        "✅ Buy alerts 5 minutes before public\n"
-        "✅ Sell alerts 5 minutes before public\n"
-        "✅ Exclusive VIP channel\n"
-        "✅ Maximum profit potential\n\n"
-        "💰 *SUBSCRIPTION:*\n"
-        "• 50 USDT/week (Mon-Sun)\n"
-        "• BEP-20 Network (BSC)\n\n"
-        "🌐 https://myboostiq.app"
-    )
-    await update.message.reply_text(
-        help_message,
-        parse_mode='Markdown'
-    )
-
-
-async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /subscribe - Muestra instrucciones de pago"""
-    subscribe_message = (
-        "💎 *VIP SUBSCRIPTION - myBoostiq*\n\n"
-        "🎯 *BENEFITS:*\n"
-        "• 2 Pumps guaranteed per week\n"
-        "• Buy signals 5 minutes EARLY\n"
-        "• Sell signals 5 minutes EARLY\n"
-        "• Exclusive VIP alerts\n"
-        "• Maximum profit advantage\n\n"
-        "💰 *PAYMENT DETAILS:*\n\n"
-        "*Amount:* 50 USDT\n"
-        "*Period:* Weekly (Monday to Sunday)\n"
-        "*Network:* BEP-20 (Binance Smart Chain)\n\n"
-        "📍 *Send payment to:*\n"
-        "`0xbad5eebd86acebf1a9457ef881b0e22a1fb5b56d`\n\n"
-        "⚠️ *IMPORTANT:*\n"
-        "• Use BEP-20 network only (BSC)\n"
-        "• Send exactly 50 USDT\n"
-        "• First subscription is full week (even if you start mid-week)\n"
-        "• Renewal: Every Monday\n\n"
-        "✅ *AFTER PAYMENT:*\n"
-        "1️⃣ Register with: `/register 0xYOUR_WALLET`\n"
-        "2️⃣ You'll be added to VIP within minutes\n"
-        "3️⃣ Start receiving early alerts!\n\n"
-        "🔍 *Verify payment on:*\n"
-        "[BscScan](https://bscscan.com/address/0xbad5eebd86acebf1a9457ef881b0e22a1fb5b56d)\n\n"
-        "📞 Support: Contact admin if issues\n\n"
-        "🌐 https://myboostiq.app"
-    )
-    await update.message.reply_text(
-        subscribe_message,
-        parse_mode='Markdown',
-        disable_web_page_preview=False
-    )
-
-
-async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /register - Registra wallet como VIP"""
-    user_id = update.effective_user.id
-    
-    # Verificar que se proporcionó una wallet
-    if not context.args or len(context.args) == 0:
-        await update.message.reply_text(
-            "❌ *Usage:* `/register 0xYOUR_WALLET`\n\n"
-            "Example:\n"
-            "`/register 0x1234567890123456789012345678901234567890`\n\n"
-            "⚠️ *Before registering:*\n"
-            "Make sure you've sent 50 USDT to:\n"
-            "`0xbad5eebd86acebf1a9457ef881b0e22a1fb5b56d`\n\n"
-            "Use `/subscribe` for payment details.",
-            parse_mode='Markdown'
-        )
-        return
-    
-    wallet = context.args[0].strip()
-    
-    # Validar formato de wallet
-    if not validate_wallet(wallet):
-        await update.message.reply_text(
-            "❌ *Invalid wallet format!*\n\n"
-            "Wallet must be:\n"
-            "• Start with `0x`\n"
-            "• Have exactly 40 hexadecimal characters\n\n"
-            "Example:\n"
-            "`0x1234567890123456789012345678901234567890`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    # Agregar a whitelist via API
-    await update.message.reply_text(
-        "⏳ *Registering wallet...*\n\n"
-        "⚠️ Make sure you've sent 50 USDT payment first!",
-        parse_mode='Markdown'
-    )
-    
-    success = add_to_whitelist(wallet)
-    
-    if success:
-        bot_state.user_wallets[user_id] = wallet
-        await update.message.reply_text(
-            f"✅ *Successfully registered as VIP!*\n\n"
-            f"Wallet: `{wallet}`\n\n"
-            f"💎 *Your VIP benefits:*\n"
-            f"• 2 Pumps per week\n"
-            f"• Buy alerts 5 minutes early\n"
-            f"• Sell alerts 5 minutes early\n"
-            f"• Exclusive VIP channel\n\n"
-            f"🔔 You'll now receive early boost alerts!\n\n"
-            f"📅 *Subscription:* Weekly (Mon-Sun)\n"
-            f"💰 *Next payment:* Next Monday (50 USDT)\n\n"
-            f"🚀 Welcome to myBoostiq VIP!",
-            parse_mode='Markdown'
-        )
-        logger.info(f"User {user_id} registered wallet: {wallet}")
-    else:
-        await update.message.reply_text(
-            "❌ *Registration failed!*\n\n"
-            "There was an error connecting to the API.\n"
-            "Please try again later or contact support.",
-            parse_mode='Markdown'
-        )
-
-
-async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /check - Verifica status VIP"""
-    user_id = update.effective_user.id
-    
-    # Obtener wallet del usuario si la tiene guardada
-    wallet = bot_state.user_wallets.get(user_id)
-    
-    if not wallet:
-        await update.message.reply_text(
-            "❌ *Not registered as VIP*\n\n"
-            "Use `/register 0xYOUR_WALLET` to become VIP!",
-            parse_mode='Markdown'
-        )
-        return
-    
-    # Verificar en whitelist
-    await update.message.reply_text("⏳ *Checking VIP status...*", parse_mode='Markdown')
-    
-    whitelist = get_whitelist()
-    
-    if wallet.lower() in [w.lower() for w in whitelist]:
-        await update.message.reply_text(
-            f"✅ *VIP STATUS: ACTIVE*\n\n"
-            f"Wallet: `{wallet}`\n\n"
-            f"You're receiving early boost alerts! 🎯",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text(
-            f"❌ *VIP STATUS: INACTIVE*\n\n"
-            f"Wallet: `{wallet}`\n\n"
-            f"Your wallet is not in the VIP list.\n"
-            f"Contact support if this is an error.",
-            parse_mode='Markdown'
-        )
-
-
-async def unregister_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /unregister - Elimina wallet de VIP"""
-    user_id = update.effective_user.id
-    
-    wallet = bot_state.user_wallets.get(user_id)
-    
-    if not wallet:
-        await update.message.reply_text(
-            "❌ You don't have a wallet registered.",
-            parse_mode='Markdown'
-        )
-        return
-    
-    await update.message.reply_text("⏳ *Removing VIP status...*", parse_mode='Markdown')
-    
-    success = remove_from_whitelist(wallet)
-    
-    if success:
-        del bot_state.user_wallets[user_id]
-        await update.message.reply_text(
-            f"✅ *VIP status removed*\n\n"
-            f"Wallet `{wallet}` is no longer VIP.\n\n"
-            f"You can register again anytime with `/register`",
-            parse_mode='Markdown'
-        )
-        logger.info(f"User {user_id} unregistered wallet: {wallet}")
-    else:
-        await update.message.reply_text(
-            "❌ *Error removing VIP status*\n\n"
-            "Please try again later.",
-            parse_mode='Markdown'
-        )
-
-
-# ============================================
-# ALERTAS
-# ============================================
-
-async def send_vip_alert(boost_data: Dict):
-    """Envía alerta a grupo VIP"""
-    try:
-        pair_symbol = boost_data.get('pair_symbol', 'Unknown')
-        contract = boost_data.get('pair', 'Unknown')
-        start_time = boost_data.get('start_time', 0)
-        
-        # Calcular minutos restantes
-        now = int(time.time())
-        minutes_left = max(0, (start_time - now) // 60)
-        
-        # Crear links
-        dexscreener_link = f"https://dexscreener.com/bsc/{contract}"
-        
-        message = (
-            "🚨 *VIP BOOST ALERT* 🚨\n\n"
-            f"*Pair:* `{pair_symbol}`\n"
-            f"*Contract:* `{contract}`\n"
-            f"*Starts in:* {minutes_left} minutes\n\n"
-            f"📊 [Chart]({dexscreener_link})\n"
-            f"🌐 [Join Boost](https://myboostiq.app)\n\n"
-            f"⏰ *Prepare your position NOW!*"
-        )
-        
-        await bot_state.application.bot.send_message(
-            chat_id=VIP_CHAT_ID,
-            text=message,
-            parse_mode='Markdown',
-            disable_web_page_preview=False
-        )
-        
-        logger.info(f"VIP alert sent for boost {boost_data.get('id')}")
-        bot_state.vip_alert_sent = True
-        
+        return True, f"Pago verificado {value:.2f} USDT."
     except Exception as e:
-        logger.error(f"Error sending VIP alert: {e}")
+        return False, f"Error verificando en BscScan: {e}"
 
+async def post_to_targets(context: ContextTypes.DEFAULT_TYPE, text: Optional[str] = None,
+                          photo_file_id: Optional[str] = None,
+                          video_file_id: Optional[str] = None):
+    targets = [config.CHANNEL_ID, config.ALERTS_GROUP_USER, config.VIP_GROUP_USER]
+    for target in targets:
+        try:
+            if video_file_id:
+                await context.bot.send_video(chat_id=target, video=video_file_id, caption=text or "")
+            elif photo_file_id:
+                await context.bot.send_photo(chat_id=target, photo=photo_file_id, caption=text or "")
+            else:
+                await context.bot.send_message(chat_id=target, text=text or "")
+            await asyncio.sleep(0.4)
+        except Exception as e:
+            log.error(f"Error publicando en {target}: {e}")
 
-async def send_public_alert(boost_data: Dict):
-    """Envía alerta al grupo público"""
-    try:
-        pair_symbol = boost_data.get('pair_symbol', 'Unknown')
-        status = boost_data.get('status', 'Unknown').upper()
-        
-        message = (
-            "🔥 *BOOST LIVE NOW!*\n\n"
-            f"*Pair:* `{pair_symbol}`\n"
-            f"*Phase:* {status}\n"
-            f"*Status:* ACTIVE ✅\n\n"
-            f"🌐 [Join at myBoostiq](https://myboostiq.app)\n\n"
-            f"⚡ *ACT FAST!*"
-        )
-        
-        await bot_state.application.bot.send_message(
-            chat_id=PUBLIC_CHAT_ID,
-            text=message,
-            parse_mode='Markdown',
-            disable_web_page_preview=False
-        )
-        
-        logger.info(f"Public alert sent for boost {boost_data.get('id')}")
-        bot_state.public_alert_sent = True
-        
-    except Exception as e:
-        logger.error(f"Error sending public alert: {e}")
+# ----------------- /start -----------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    lang = (user.language_code or "es")
+    name = user.first_name or user.username or "Trader"
 
+    msg = t(
+        lang,
+        f"👋 Bienvenido {name} a **My Boost IQ**\n"
+        f"💥 Donde los +1000% sí existen.\n\n"
+        f"Usa /menu para ver opciones y /subscribe para VIP (50 USDT, 7 días, 2 pumps).\n"
+        f"Web: {config.OFFICIAL_WEB}",
 
-# ============================================
-# MONITORING LOOP
-# ============================================
+        f"👋 Welcome {name} to **My Boost IQ**\n"
+        f"💥 Where +1000% gains are real.\n\n"
+        f"Use /menu for options and /subscribe for VIP (50 USDT, 7 days, 2 pumps).\n"
+        f"Web: {config.OFFICIAL_WEB}"
+    )
+    await update.message.reply_markdown(msg, reply_markup=menu_keyboard(lang))
 
-def monitoring_loop():
-    """Loop principal de monitoreo (corre en background)"""
-    logger.info("Starting monitoring loop...")
-    
+# ----------------- /menu -----------------
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = (update.effective_user.language_code or "es")
+    title = t(lang, "🟩 Menú", "🟩 Menu")
+    await update.message.reply_text(title, reply_markup=menu_keyboard(lang))
+
+# ----------------- /status -----------------
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    lang = (update.effective_user.language_code or "es")
+    s = subs.get(uid)
+    if not s:
+        await update.message.reply_text(t(lang, "No tienes una suscripción activa.", "You have no active subscription."))
+        return
+    until = datetime.fromisoformat(s["until"])
+    left = until - now_utc()
+    days = max(0, left.days)
+    hours = max(0, int(left.seconds/3600))
+    await update.message.reply_text(
+        t(lang,
+          f"Tu suscripción VIP expira el {fmt_dt(until)}. Tiempo restante: {days}d {hours}h.",
+          f"Your VIP subscription expires on {fmt_dt(until)}. Time left: {days}d {hours}h.")
+    )
+
+# ----------------- /subscribe (flujo) -----------------
+ASK_HASH = 1
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = (update.effective_user.language_code or "es")
+    info = t(
+        lang,
+        f"💎 Suscripción VIP: 50 USDT por {config.DURATION_DAYS} días (2 pumps).\n"
+        f"Red: BSC (BEP20)\n"
+        f"Token: USDT\n"
+        f"Wallet: `{config.SUB_WALLET}`\n\n"
+        f"Envía el **hash** de tu pago para validar.",
+        f"💎 VIP Subscription: 50 USDT for {config.DURATION_DAYS} days (2 pumps).\n"
+        f"Network: BSC (BEP20)\n"
+        f"Token: USDT\n"
+        f"Wallet: `{config.SUB_WALLET}`\n\n"
+        f"Send your payment **tx hash** to validate."
+    )
+    await update.message.reply_markdown(info)
+    await update.message.reply_text(t(lang, "Pega el hash aquí:", "Paste the tx hash here:"))
+    return ASK_HASH
+
+TX_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
+
+async def on_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = (update.effective_user.language_code or "es")
+    tx = (update.message.text or "").strip()
+    if not TX_RE.match(tx):
+        await update.message.reply_text(t(lang, "Hash inválido. Intenta de nuevo.", "Invalid hash. Try again."))
+        return ASK_HASH
+
+    await update.message.reply_text(t(lang, "Validando pago en BscScan...", "Validating payment on BscScan..."))
+    ok, detail = await asyncio.to_thread(verify_usdt_payment, tx)
+    if not ok:
+        await update.message.reply_text(t(lang, f"❌ Pago no válido: {detail}", f"❌ Payment invalid: {detail}"))
+        return ConversationHandler.END
+
+    # activar suscripción
+    uid = str(update.effective_user.id)
+    until = until_from_now(config.DURATION_DAYS)
+    subs[uid] = {"until": until.isoformat(), "tx": tx}
+    save_subs(subs)
+
+    await update.message.reply_text(t(lang, f"✅ {detail}\nVIP activo hasta {fmt_dt(until)}.",
+                                         f"✅ {detail}\nVIP active until {fmt_dt(until)}."))
+
+    # invitar a VIP (enlace por username)
+    vip_link = f"https://t.me/{config.VIP_GROUP_USER.lstrip('@')}"
+    await update.message.reply_text(t(lang,
+        f"Accede al Grupo VIP: {vip_link}",
+        f"Access VIP Group: {vip_link}"))
+    return ConversationHandler.END
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelado / Cancelled.")
+    return ConversationHandler.END
+
+# ----------------- /announce (solo OWNER) -----------------
+ANN_DATE, ANN_TIME, ANN_CONTENT, ANN_CONFIRM = range(4)
+
+def owner_required(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not is_owner(uid):
+            await update.message.reply_text("Unauthorized.")
+            return ConversationHandler.END if isinstance(update, Update) else None
+        return await func(update, context)
+    return wrapper
+
+@owner_required
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🇪🇸 Escribe la fecha (ej: 2025-11-07)\n🇬🇧 Enter date (YYYY-MM-DD)")
+    return ANN_DATE
+
+async def ann_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["date"] = (update.message.text or "").strip()
+    await update.message.reply_text("🇪🇸 Escribe la hora (ej: 18:00 UTC)\n🇬🇧 Enter time (e.g. 18:00 UTC)")
+    return ANN_TIME
+
+async def ann_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["time"] = (update.message.text or "").strip()
+    await update.message.reply_text("🇪🇸 Envía el texto o adjunta el flyer/video.\n🇬🇧 Send the text or attach flyer/video.")
+    return ANN_CONTENT
+
+async def ann_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.caption or update.message.text or ""
+    context.user_data["text"] = text
+
+    # guardar media opcional
+    photo_id = None
+    video_id = None
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+    if update.message.video:
+        video_id = update.message.video.file_id
+    context.user_data["photo"] = photo_id
+    context.user_data["video"] = video_id
+
+    d = context.user_data.get("date")
+    t = context.user_data.get("time")
+
+    preview = (
+        "🚀 My Boost IQ Official Announcement\n\n"
+        f"🇪🇸 Próximo Pump\nFecha: {d}\nHora: {t}\nToken revelado al lanzamiento.\n\n"
+        f"🇬🇧 Next Pump\nDate: {d}\nTime: {t}\nToken revealed at launch.\n\n"
+        f"🌐 {config.OFFICIAL_WEB}"
+    )
+    await update.message.reply_text(preview + "\n\nPublicar? (yes/no)")
+    return ANN_CONFIRM
+
+async def ann_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conf = (update.message.text or "").strip().lower()
+    if conf not in ("y", "yes", "si", "sí"):
+        await update.message.reply_text("Cancelado.")
+        return ConversationHandler.END
+
+    text = context.user_data.get("text") or ""
+    photo = context.user_data.get("photo")
+    video = context.user_data.get("video")
+    d = context.user_data.get("date")
+    tm = context.user_data.get("time")
+
+    final_text = (
+        "🚀 **My Boost IQ Official Announcement**\n\n"
+        f"🇪🇸 *Próximo Pump*\n"
+        f"🔥 Fecha: {d}\n⏰ Hora: {tm}\n💥 Token revelado al lanzamiento.\n\n"
+        f"🇬🇧 *Next Pump*\n"
+        f"🔥 Date: {d}\n⏰ Time: {tm}\n💥 Token revealed at launch.\n\n"
+        f"{text}\n\n"
+        f"🌐 {config.OFFICIAL_WEB}"
+    )
+
+    await post_to_targets(context, text=final_text, photo_file_id=photo, video_file_id=video)
+    await update.message.reply_text("Publicado en canal y grupos.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ----------------- TAREAS: limpieza de suscripciones vencidas -----------------
+async def expire_job(app):
     while True:
         try:
-            # Obtener estado actual
-            status = get_api_status()
-            
-            if not status:
-                logger.warning("No status data received, retrying in 30s...")
-                time.sleep(30)
-                continue
-            
-            boost_id = status.get('id')
-            boost_status = status.get('status')
-            start_time = status.get('start_time', 0)
-            
-            logger.info(f"Status check - ID: {boost_id}, Status: {boost_status}")
-            
-            # Detectar nuevo boost
-            if boost_id != bot_state.last_boost_id:
-                logger.info(f"New boost detected: {boost_id}")
-                bot_state.last_boost_id = boost_id
-                bot_state.vip_alert_sent = False
-                bot_state.public_alert_sent = False
-            
-            # Si el boost está en estado "pre" y no se ha enviado alerta VIP
-            if boost_status == "pre" and not bot_state.vip_alert_sent:
-                now = int(time.time())
-                minutes_left = (start_time - now) / 60
-                
-                logger.info(f"Boost in 'pre' status. Minutes left: {minutes_left:.2f}")
-                
-                # Enviar alerta VIP si faltan <= 5 minutos
-                if 0 < minutes_left <= 5:
-                    logger.info("Sending VIP alert (5 min before start)")
-                    import asyncio
-                    asyncio.run(send_vip_alert(status))
-            
-            # Si el boost está activo (buy o sell) y no se ha enviado alerta pública
-            if boost_status in ["buy", "sell"] and not bot_state.public_alert_sent:
-                logger.info("Boost is live, sending public alert")
-                import asyncio
-                asyncio.run(send_public_alert(status))
-            
-            # Reset si el boost cerró
-            if boost_status == "closed":
-                if bot_state.vip_alert_sent or bot_state.public_alert_sent:
-                    logger.info("Boost closed, resetting alert flags")
-                    bot_state.vip_alert_sent = False
-                    bot_state.public_alert_sent = False
-            
+            changed = False
+            for uid, data in list(subs.items()):
+                until = datetime.fromisoformat(data["until"])
+                if now_utc() > until:
+                    subs.pop(uid, None)
+                    changed = True
+                    try:
+                        # intento de notificar al usuario
+                        await app.bot.send_message(chat_id=int(uid),
+                            text="Tu suscripción VIP ha expirado. Renueva con /subscribe.")
+                    except Exception:
+                        pass
+            if changed:
+                save_subs(subs)
         except Exception as e:
-            logger.error(f"Error in monitoring loop: {e}")
-        
-        # Esperar 30 segundos antes del próximo check
-        time.sleep(30)
+            log.error(f"expire_job error: {e}")
+        await asyncio.sleep(3600)  # cada hora
 
+# ----------------- /help -----------------
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/start /menu /subscribe /status\n"
+        "Admin: /announce"
+    )
 
-# ============================================
-# MAIN
-# ============================================
+# ----------------- MAIN -----------------
+def build_application():
+    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+
+    # comandos
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("help", cmd_help))
+
+    # subscribe flow
+    sub_conv = ConversationHandler(
+        entry_points=[CommandHandler("subscribe", cmd_subscribe)],
+        states={
+            ASK_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_hash)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        allow_reentry=True
+    )
+    app.add_handler(sub_conv)
+
+    # announce flow (owner only)
+    ann_conv = ConversationHandler(
+        entry_points=[CommandHandler("announce", cmd_announce)],
+        states={
+            ANN_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ann_date)],
+            ANN_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ann_time)],
+            ANN_CONTENT: [MessageHandler((filters.TEXT | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, ann_content)],
+            ANN_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ann_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        allow_reentry=True
+    )
+    app.add_handler(ann_conv)
+
+    return app
 
 def main():
-    """Función principal"""
-    
-    # Validar variables de entorno
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not set!")
-        return
-    
-    if not VIP_CHAT_ID or not PUBLIC_CHAT_ID:
-        logger.warning("VIP_CHAT_ID or PUBLIC_CHAT_ID not set. Alerts will fail.")
-    
-    logger.info("Starting myBoostiq Telegram Bot...")
-    logger.info(f"API Base URL: {API_BASE_URL}")
-    
-    # Crear aplicación
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    bot_state.application = application
-    
-    # Registrar comandos
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("subscribe", subscribe_command))
-    application.add_handler(CommandHandler("register", register_command))
-    application.add_handler(CommandHandler("check", check_command))
-    application.add_handler(CommandHandler("unregister", unregister_command))
-    
-    # Iniciar monitoring loop en thread separado
-    monitor_thread = threading.Thread(target=monitoring_loop, daemon=True)
-    monitor_thread.start()
-    logger.info("Monitoring thread started")
-    
-    # Iniciar bot
-    logger.info("Bot is running...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("Starting MyBoostIQ MasterBot…")
+    app = build_application()
+    # job de expiración
+    app.post_init(lambda _: asyncio.create_task(expire_job(app)))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
