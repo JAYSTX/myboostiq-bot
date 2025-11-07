@@ -1,7 +1,7 @@
 import os
 
 # --- ENV OBLIGATORIAS ---
-BOT_TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN")            # token del bot
+BOT_TOKEN         = os.getenv("8091608519:AAHV2vqBBORkjjwxXlHFjSwHyp2uAzHS0to")            # token del bot
 BSC_API_KEY       = os.getenv("BSC_API_KEY")                   # API Key de BscScan
 OWNER_ID          = int(os.getenv("OWNER_ID", "5712520691"))   # @CRIPTOJAY
 SUB_WALLET        = os.getenv("SUB_WALLET", "0xbad5eebd86acebf1a9457ef881b0e22a1fb5b56d")
